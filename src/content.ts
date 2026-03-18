@@ -281,16 +281,45 @@ async function dispatchPromptUpdate(draftTokens: number, site: SiteId): Promise<
 }
 
 // ─── Storage Helpers ──────────────────────────────────────────────────────────
+// Settings are read from chrome.storage.local (fast, mirrored from sync by
+// background.ts).  Usage is always in local storage, keyed as "site::YYYY-MM-DD".
+
+// Cache settings in-memory to avoid hitting storage on every keystroke
+let _cachedSettings: { limits: Record<string, number>; ts: number } | null = null;
+const SETTINGS_CACHE_TTL = 5_000; // 5 seconds
 
 async function getDailyLimit(site: SiteId): Promise<number> {
   try {
-    const data = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
-    const settings = data[STORAGE_KEYS.SETTINGS];
+    const now = Date.now();
+    if (_cachedSettings && now - _cachedSettings.ts < SETTINGS_CACHE_TTL) {
+      return _cachedSettings.limits[site] ?? DEFAULT_LIMITS[site];
+    }
+
+    // Try local first (faster), then sync as fallback
+    const localData = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
+    let settings = localData[STORAGE_KEYS.SETTINGS];
+
+    if (!settings) {
+      const syncData = await chrome.storage.sync.get(STORAGE_KEYS.SETTINGS);
+      settings = syncData[STORAGE_KEYS.SETTINGS];
+    }
+
+    if (settings?.limits) {
+      _cachedSettings = { limits: settings.limits, ts: now };
+    }
+
     return settings?.limits?.[site] ?? DEFAULT_LIMITS[site];
   } catch {
     return DEFAULT_LIMITS[site];
   }
 }
+
+// Invalidate cache when settings change (popup saves new limits)
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (changes[STORAGE_KEYS.SETTINGS]) {
+    _cachedSettings = null;
+  }
+});
 
 async function getUsedToday(site: SiteId): Promise<number> {
   try {
