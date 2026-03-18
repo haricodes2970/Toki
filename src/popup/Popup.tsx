@@ -206,6 +206,14 @@ function Popup() {
           >
             Reset Today's Usage
           </button>
+
+          {/* Open full dashboard */}
+          <button
+            onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL("src/dashboard/dashboard.html") })}
+            className="w-full py-2 rounded-lg text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-toki-400 hover:text-toki-300 transition-colors border border-zinc-800"
+          >
+            📊 View Full Dashboard
+          </button>
         </div>
       )}
 
