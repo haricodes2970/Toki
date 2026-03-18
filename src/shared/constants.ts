@@ -1,5 +1,4 @@
 // EXTENSION FILE: src/shared/constants.ts
-// App-wide constants – never put secrets here (MV3 bundles are readable).
 
 import type { DailyLimits, SiteConfig, SiteId } from "./types";
 
@@ -15,10 +14,12 @@ export const STORAGE_KEYS = {
 
 export const DAILY_RESET_ALARM = "toki_daily_reset";
 
+// ─── Overlay DOM ID ───────────────────────────────────────────────────────────
+// Used to exclude Toki's own shadow host from MutationObserver callbacks.
+
+export const OVERLAY_HOST_ID = "toki-overlay-root";
+
 // ─── Default Limits (tokens / day per site) ───────────────────────────────────
-// These are conservative starting points; users can override in settings.
-// ChatGPT Plus = ~40 msgs / 3 hrs on GPT-4o (~2k tokens avg → ~80k/day equiv.)
-// Claude.ai Pro = ~45 msgs / 5 hrs on Sonnet (~1.5k avg → ~67k/day equiv.)
 
 export const DEFAULT_LIMITS: DailyLimits = {
   chatgpt: 80_000,
@@ -28,37 +29,101 @@ export const DEFAULT_LIMITS: DailyLimits = {
 };
 
 // ─── Site Configs ─────────────────────────────────────────────────────────────
-// Selectors are best-effort approximations; Module 2 will harden these with
-// site-specific adapter files that can be updated independently.
+// Each inputSelectors / submitSelectors array is ordered: first match wins.
+// Keeping multiple selectors guards against site UI updates breaking tracking.
 
 export const SITE_CONFIGS: Record<SiteId, SiteConfig> = {
+  // ── ChatGPT ────────────────────────────────────────────────────────────────
+  // Input is a plain <textarea id="prompt-textarea">.
+  // Submit button carries data-testid="send-button" (stable); aria-label is
+  // a secondary fallback in case the testid is ever removed.
   chatgpt: {
-    label:           "ChatGPT",
-    submitSelector:  "[data-testid='send-button'], button[aria-label='Send prompt']",
+    label: "ChatGPT",
+    inputSelectors: [
+      "#prompt-textarea",                        // primary – stable testid
+      "textarea[data-id='root']",                // older GPT-4 UI
+      "textarea[placeholder]",                   // last resort
+    ],
+    submitSelectors: [
+      "[data-testid='send-button']",             // most reliable
+      "button[aria-label='Send prompt']",
+      "button[aria-label='Send message']",
+      "form button[type='button']:last-of-type", // generic fallback
+    ],
     messageSelector: "[data-message-author-role='user']",
-    inputSelector:   "#prompt-textarea",
-    accentClass:     "bg-green-500",
+    inputType:   "textarea",
+    enterSubmits: true,
+    accentClass: "bg-green-500",
   },
-  gemini: {
-    label:           "Gemini",
-    submitSelector:  "button.send-button, [aria-label='Send message']",
-    messageSelector: ".user-query-container, .user-message",
-    inputSelector:   ".ql-editor[contenteditable='true'], textarea.input-area",
-    accentClass:     "bg-blue-500",
-  },
+
+  // ── Claude ─────────────────────────────────────────────────────────────────
+  // ProseMirror contenteditable div. The aria-label on the send button is
+  // reliable; data-testid is an alternative seen in some versions.
   claude: {
-    label:           "Claude",
-    submitSelector:  "button[aria-label='Send Message'], button[type='submit']",
+    label: "Claude",
+    inputSelectors: [
+      "div[contenteditable='true'].ProseMirror",     // primary
+      "[data-testid='chat-input'] div[contenteditable='true']",
+      "div[contenteditable='true'][aria-label]",     // labelled fallback
+      "div[contenteditable='true']",                 // last resort
+    ],
+    submitSelectors: [
+      "button[aria-label='Send Message']",
+      "[data-testid='send-button']",
+      "button[type='submit']",
+    ],
     messageSelector: "[data-testid='human-turn-content']",
-    inputSelector:   "div[contenteditable='true'].ProseMirror",
-    accentClass:     "bg-orange-500",
+    inputType:   "contenteditable",
+    enterSubmits: true,
+    accentClass: "bg-orange-500",
   },
+
+  // ── Gemini ─────────────────────────────────────────────────────────────────
+  // Uses a Quill-based rich-textarea (.ql-editor) or a plain div[role=textbox].
+  // Gemini does NOT submit on bare Enter (Enter adds a newline) – only the
+  // button click or Ctrl+Enter triggers send.
+  gemini: {
+    label: "Gemini",
+    inputSelectors: [
+      "div.ql-editor[contenteditable='true']",       // Quill editor (primary)
+      "rich-textarea div[contenteditable='true']",   // web component wrapper
+      "div[role='textbox'][contenteditable='true']", // generic ARIA textbox
+      "textarea.input-area",                         // older Gemini UI
+    ],
+    submitSelectors: [
+      "button[aria-label='Send message']",
+      "button[aria-label='Submit']",
+      "button.send-button",
+      "mat-icon-button[aria-label='Send message']",  // Material button wrapper
+    ],
+    messageSelector: ".user-query-container .user-query-text, .user-message",
+    inputType:   "contenteditable",
+    enterSubmits: false, // Gemini uses Enter for newline; only button submits
+    accentClass: "bg-blue-500",
+  },
+
+  // ── Grok ──────────────────────────────────────────────────────────────────
+  // Lives on both x.com/i/grok and grok.x.ai.
+  // The main input is a <textarea>; contenteditable is a secondary fallback
+  // used in some embedded views.
   grok: {
-    label:           "Grok",
-    submitSelector:  "button[type='submit'], button[aria-label='Send']",
-    messageSelector: "[class*='userMessage'], [data-testid='userMessage']",
-    inputSelector:   "textarea[placeholder], div[contenteditable='true']",
-    accentClass:     "bg-purple-500",
+    label: "Grok",
+    inputSelectors: [
+      "textarea[data-testid='grok-prompt-input']",   // testid (most stable)
+      "textarea[aria-label='Ask anything']",
+      "textarea[placeholder]",                       // placeholder-based fallback
+      "div[contenteditable='true'][aria-label]",
+      "div[contenteditable='true']",
+    ],
+    submitSelectors: [
+      "button[aria-label='Send']",
+      "button[data-testid='send-button']",
+      "button[type='submit']",
+    ],
+    messageSelector: "[data-testid='userMessage'], [class*='UserMessage']",
+    inputType:   "textarea",
+    enterSubmits: true,
+    accentClass: "bg-purple-500",
   },
 };
 

@@ -1,35 +1,33 @@
 // EXTENSION FILE: src/content.ts
 // ─────────────────────────────────────────────────────────────────────────────
-// Content Script – Toki AI Usage Monitor
-// Injected into: chatgpt.com | gemini.google.com | claude.ai | grok.x.ai
+// Content Script – Toki AI Usage Monitor  (Phase 5 – robust multi-site)
 //
-// Pipeline per keystroke:
-//   user types → estimateTokens(text) → dispatch toki:prompt-update →
-//   Overlay renders live count + warning
-//
-// Pipeline on submit:
-//   submit detected → captureAndRecord() → sendMessage(RECORD_USAGE) →
-//   background persists to storage → dispatch toki:usage-recorded
+// Key improvements over Phase 3:
+//  • Uses per-site SiteAdapter (selector chains, site-specific key logic)
+//  • MutationObserver ignores Toki's own shadow host (#toki-overlay-root)
+//  • Handles SPA navigation (history.pushState / popstate)
+//  • Re-attaches listeners after every new-chat DOM remount
+//  • extractText delegates to adapter (innerText vs .value)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { SiteId, TokiMessage, UsageRecord } from "@/shared/types";
-import { SITE_CONFIGS, DEFAULT_LIMITS, STORAGE_KEYS } from "@/shared/constants";
+import { DEFAULT_LIMITS, OVERLAY_HOST_ID, STORAGE_KEYS } from "@/shared/constants";
 import { mountOverlay } from "@/overlay/mountOverlay";
 import { estimateTokens, ensureTokenizerReady } from "@/overlay/tokenizer";
+import { getAdapter } from "@/adapters/index";
+import type { SiteAdapter } from "@/adapters/types";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Public event detail types (imported by Overlay.tsx) ─────────────────────
 
-/** Fired when the user is actively typing – carries live estimate */
 export interface PromptUpdateDetail {
-  tokens:        number;   // estimate for current draft
-  totalIfSent:   number;   // existing usage + this prompt
-  limitTokens:   number;   // user's daily cap
-  pct:           number;   // totalIfSent / limitTokens * 100
-  isOverWarning: boolean;  // pct > WARNING_THRESHOLD
-  isOverDanger:  boolean;  // pct > DANGER_THRESHOLD
+  tokens:        number;
+  totalIfSent:   number;
+  limitTokens:   number;
+  pct:           number;
+  isOverWarning: boolean;
+  isOverDanger:  boolean;
 }
 
-/** Fired after a prompt is recorded to storage */
 export interface UsageRecordedDetail {
   tokens:  number;
   prompts: number;
@@ -38,32 +36,27 @@ export interface UsageRecordedDetail {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const WARNING_THRESHOLD = 80;  // % – yellow warning
-const DANGER_THRESHOLD  = 90;  // % – red danger
-
-// How long to wait after a submit event before trying to read the textarea
-// (most AI sites clear the input ~100ms after click/enter)
+const WARNING_THRESHOLD  = 80;
+const DANGER_THRESHOLD   = 90;
 const SUBMIT_DEBOUNCE_MS = 60;
-
-// Minimum chars to bother estimating (avoids noise from arrow-key presses)
-const MIN_CHARS = 3;
+const MIN_CHARS          = 3;
+const INPUT_WAIT_TIMEOUT = 10_000; // 10 s max wait for input to appear
 
 // ─── Site Detection ───────────────────────────────────────────────────────────
 
 function detectSite(): SiteId | null {
   const host = window.location.hostname;
-  if (host.includes("chatgpt.com"))        return "chatgpt";
-  if (host.includes("gemini.google.com"))  return "gemini";
-  if (host.includes("claude.ai"))          return "claude";
-  if (host.includes("grok.x.ai"))          return "grok";
+  if (host.includes("chatgpt.com"))       return "chatgpt";
+  if (host.includes("gemini.google.com")) return "gemini";
+  if (host.includes("claude.ai"))         return "claude";
+  if (host.includes("grok.x.ai"))         return "grok";
   if (host.includes("x.com") && window.location.pathname.startsWith("/i/grok")) return "grok";
   return null;
 }
 
-// ─── Entry Point ─────────────────────────────────────────────────────────────
+// ─── Entry ────────────────────────────────────────────────────────────────────
 
 const siteId = detectSite();
-
 if (!siteId) {
   console.warn("[Toki] Unrecognised site – aborting.");
 } else {
@@ -74,176 +67,158 @@ if (!siteId) {
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
 async function boot(site: SiteId): Promise<void> {
-  // Wait for DOM + WASM in parallel
   await Promise.all([waitForDOM(), ensureTokenizerReady()]);
-
   mountOverlay(site);
-  await attachObservers(site);
+
+  const adapter = getAdapter(site);
+  await attachAll(site, adapter);
+
+  // SPA navigation: re-run attachment on every route change
+  listenForNavigation(site, adapter);
 }
 
-// ─── DOM Ready ───────────────────────────────────────────────────────────────
+// ─── Attach all listeners ─────────────────────────────────────────────────────
 
-function waitForDOM(): Promise<void> {
-  return new Promise((resolve) => {
-    if (document.readyState !== "loading") { resolve(); return; }
-    document.addEventListener("DOMContentLoaded", () => resolve(), { once: true });
-  });
+async function attachAll(site: SiteId, adapter: SiteAdapter): Promise<void> {
+  // Submit listeners are document-level (delegation) – attach once only
+  if (!(attachAll as { _submitAttached?: boolean })._submitAttached) {
+    attachSubmitListeners(site, adapter);
+    (attachAll as { _submitAttached?: boolean })._submitAttached = true;
+  }
+
+  // Input listener needs the actual element
+  let inputEl = adapter.getInputEl();
+  if (!inputEl) {
+    inputEl = await waitForElement(adapter, INPUT_WAIT_TIMEOUT);
+  }
+  if (inputEl) {
+    attachInputListener(inputEl, site, adapter);
+  }
+
+  // Respawn watcher for new-chat DOM remounts
+  watchForInputRespawn(site, adapter);
 }
 
-// ─── Observer Setup ───────────────────────────────────────────────────────────
-// Some AI sites mount their textarea asynchronously (React hydration, route
-// changes). We use a MutationObserver to detect when the target input appears,
-// then attach the actual event listeners.
+// ─── SPA Navigation ───────────────────────────────────────────────────────────
+// AI sites are SPAs – navigating to a new chat doesn't reload the page but
+// does unmount + remount the prompt area. We listen to both popstate and
+// the monkey-patched pushState to detect this.
 
-async function attachObservers(site: SiteId): Promise<void> {
-  const config = SITE_CONFIGS[site];
+function listenForNavigation(site: SiteId, adapter: SiteAdapter): void {
+  let lastUrl = location.href;
 
-  // Try immediately first
-  if (tryAttachInputListeners(site, config.inputSelector)) return;
+  function onNav() {
+    if (location.href === lastUrl) return;
+    lastUrl = location.href;
+    console.log("[Toki] SPA navigation detected – re-attaching input listener.");
+    // Small delay to let React re-render
+    setTimeout(() => attachAll(site, adapter), 500);
+  }
 
-  // Fallback: wait for the input to appear in the DOM
-  await waitForElement(config.inputSelector, 8000);
-  tryAttachInputListeners(site, config.inputSelector);
+  window.addEventListener("popstate", onNav);
 
-  // Also watch for SPA navigation re-mounting the input (e.g. new chat)
-  watchForInputRespawn(site);
-}
-
-/**
- * Attaches input + submit listeners once the target element exists.
- * Returns true if the element was found and listeners attached.
- */
-function tryAttachInputListeners(site: SiteId, inputSelector: string): boolean {
-  const el = document.querySelector(inputSelector);
-  if (!el) return false;
-
-  attachInputListener(el as HTMLElement, site);
-  attachSubmitListeners(site);
-  console.log(`[Toki] Listeners attached for "${site}".`);
-  return true;
-}
-
-/**
- * MutationObserver that re-attaches listeners when the AI site unmounts and
- * remounts the prompt area (e.g. after starting a new conversation).
- */
-function watchForInputRespawn(site: SiteId): void {
-  const config = SITE_CONFIGS[site];
-  let attached = false;
-
-  const mo = new MutationObserver(() => {
-    if (attached) return;
-    const el = document.querySelector(config.inputSelector);
-    if (!el) return;
-    attached = true;
-    attachInputListener(el as HTMLElement, site);
-    // Don't stop the observer – a new chat could remount the input
-    setTimeout(() => { attached = false; }, 2000);
-  });
-
-  mo.observe(document.body, { childList: true, subtree: true });
+  // Patch pushState (used by React Router / Next.js)
+  const origPush = history.pushState.bind(history);
+  history.pushState = function (...args) {
+    origPush(...args);
+    onNav();
+  };
 }
 
 // ─── Input Listener ───────────────────────────────────────────────────────────
 
+// Track which elements already have listeners to avoid duplicates
+const attachedInputEls = new WeakSet<HTMLElement>();
 let liveText = "";
 
-function attachInputListener(el: HTMLElement, site: SiteId): void {
-  // `input` fires on both <textarea> and contenteditable <div>
-  el.addEventListener("input", () => {
-    const text = extractText(el);
-    liveText = text;
+function attachInputListener(el: HTMLElement, site: SiteId, adapter: SiteAdapter): void {
+  if (attachedInputEls.has(el)) return;
+  attachedInputEls.add(el);
 
+  const onInput = () => {
+    const text = adapter.extractText(el);
+    liveText = text;
     if (text.length < MIN_CHARS) {
-      // Draft cleared – reset the overlay warning state
-      dispatchPromptUpdate(0, site);
+      void dispatchPromptUpdate(0, site);
       return;
     }
+    void dispatchPromptUpdate(estimateTokens(text), site);
+  };
 
-    const tokens = estimateTokens(text);
-    dispatchPromptUpdate(tokens, site);
-  });
+  el.addEventListener("input", onInput);
 
-  // Also handle paste – `input` fires for paste too, but explicit just in case
   el.addEventListener("paste", () => {
-    // Allow paste to land in DOM before reading
     requestAnimationFrame(() => {
-      const text = extractText(el);
+      const text = adapter.extractText(el);
       liveText = text;
-      dispatchPromptUpdate(estimateTokens(text), site);
+      void dispatchPromptUpdate(estimateTokens(text), site);
     });
   });
+
+  console.log(`[Toki] Input listener attached (${el.tagName}#${el.id || el.className.slice(0, 20)})`);
 }
 
-// ─── Submit Listeners ─────────────────────────────────────────────────────────
+// ─── Submit Listeners (document-level delegation) ────────────────────────────
 
-let lastRecordedText = "";
+let lastRecordedText      = "";
 let submitDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-function attachSubmitListeners(site: SiteId): void {
-  const config = SITE_CONFIGS[site];
-
-  // Strategy A – click on the send button (capture phase beats stopPropagation)
+function attachSubmitListeners(site: SiteId, adapter: SiteAdapter): void {
+  // Click – capture phase so we fire before the site's own handlers
   document.addEventListener("click", (e) => {
+    // Ignore clicks inside our own overlay
     const target = e.target as Element | null;
     if (!target) return;
-    if (target.closest(config.submitSelector)) {
-      scheduleCapture(site);
+    if (target.closest(`#${OVERLAY_HOST_ID}`)) return;
+
+    if (adapter.isSubmitClickEvent(e as MouseEvent)) {
+      scheduleCapture(site, adapter);
     }
   }, true);
 
-  // Strategy B – Enter key inside the prompt input
+  // Keyboard
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter" || e.shiftKey || e.ctrlKey) return;
     const target = e.target as Element | null;
     if (!target) return;
-    if (target.closest(config.inputSelector)) {
-      scheduleCapture(site);
+    if (target.closest(`#${OVERLAY_HOST_ID}`)) return;
+
+    if (!adapter.isSubmitKeyEvent(e as KeyboardEvent)) return;
+
+    // Only trigger if focus is in the prompt input
+    const inputEl = adapter.getInputEl();
+    if (!inputEl) return;
+    if (inputEl.contains(target) || inputEl === target) {
+      scheduleCapture(site, adapter);
     }
   }, true);
 }
 
-/**
- * Debounced capture: we schedule slightly after the event fires because
- * some sites dispatch their own handlers that clear the textarea first.
- * We use `liveText` (last known draft) to avoid reading an empty field.
- */
-function scheduleCapture(site: SiteId): void {
+function scheduleCapture(site: SiteId, adapter: SiteAdapter): void {
   if (submitDebounceTimer) clearTimeout(submitDebounceTimer);
   submitDebounceTimer = setTimeout(() => {
-    captureAndRecord(site);
+    void captureAndRecord(site, adapter);
     submitDebounceTimer = null;
   }, SUBMIT_DEBOUNCE_MS);
 }
 
 // ─── Capture & Record ─────────────────────────────────────────────────────────
 
-async function captureAndRecord(site: SiteId): Promise<void> {
-  const config = SITE_CONFIGS[site];
-  const el     = document.querySelector<HTMLElement>(config.inputSelector);
-
-  // Prefer the live draft text; fall back to reading the DOM directly
-  let text = liveText || (el ? extractText(el) : "");
+async function captureAndRecord(site: SiteId, adapter: SiteAdapter): Promise<void> {
+  const inputEl = adapter.getInputEl();
+  const text    = liveText || (inputEl ? adapter.extractText(inputEl) : "");
 
   if (!text || text === lastRecordedText) return;
   lastRecordedText = text;
-  liveText = ""; // reset draft after capture
+  liveText = "";
 
   const tokens = estimateTokens(text);
-  console.log(`[Toki] Submitting ~${tokens} tokens`);
+  console.log(`[Toki] Capture: ~${tokens} tokens on "${site}"`);
 
-  const record: UsageRecord = {
-    siteId,
-    tokens,
-    prompts:  1,
-    lastUsed: Date.now(),
-  };
-
+  const record: UsageRecord = { siteId: site, tokens, prompts: 1, lastUsed: Date.now() };
   const message: TokiMessage = { type: "RECORD_USAGE", payload: record };
 
   try {
     await chrome.runtime.sendMessage(message);
-    // Tell the overlay the prompt was sent so it can reset the live counter
     document.dispatchEvent(
       new CustomEvent<UsageRecordedDetail>("toki:usage-recorded", {
         detail: { tokens, prompts: 1, siteId: site },
@@ -256,37 +231,98 @@ async function captureAndRecord(site: SiteId): Promise<void> {
 
 // ─── Live Token Dispatch ──────────────────────────────────────────────────────
 
-/** Reads current stored usage, computes totals, fires toki:prompt-update */
 async function dispatchPromptUpdate(draftTokens: number, site: SiteId): Promise<void> {
   const limit = await getDailyLimit(site);
   const used  = await getUsedToday(site);
-
-  const totalIfSent   = used + draftTokens;
-  const pct           = limit > 0 ? Math.min((totalIfSent / limit) * 100, 100) : 0;
-  const isOverWarning = pct >= WARNING_THRESHOLD;
-  const isOverDanger  = pct >= DANGER_THRESHOLD;
-
-  const detail: PromptUpdateDetail = {
-    tokens: draftTokens,
-    totalIfSent,
-    limitTokens: limit,
-    pct,
-    isOverWarning,
-    isOverDanger,
-  };
+  const total = used + draftTokens;
+  const pct   = limit > 0 ? Math.min((total / limit) * 100, 100) : 0;
 
   document.dispatchEvent(
-    new CustomEvent<PromptUpdateDetail>("toki:prompt-update", { detail }),
+    new CustomEvent<PromptUpdateDetail>("toki:prompt-update", {
+      detail: {
+        tokens:        draftTokens,
+        totalIfSent:   total,
+        limitTokens:   limit,
+        pct,
+        isOverWarning: pct >= WARNING_THRESHOLD,
+        isOverDanger:  pct >= DANGER_THRESHOLD,
+      },
+    }),
   );
 }
 
-// ─── Storage Helpers ──────────────────────────────────────────────────────────
-// Settings are read from chrome.storage.local (fast, mirrored from sync by
-// background.ts).  Usage is always in local storage, keyed as "site::YYYY-MM-DD".
+// ─── MutationObserver – respawn watcher ──────────────────────────────────────
+// Watches for the prompt input to be removed + re-added (new chat, navigation).
+// Crucially filters out mutations inside #toki-overlay-root so we never
+// re-trigger on our own DOM changes.
 
-// Cache settings in-memory to avoid hitting storage on every keystroke
+function watchForInputRespawn(site: SiteId, adapter: SiteAdapter): void {
+  let cooldown = false;
+
+  const mo = new MutationObserver((mutations) => {
+    if (cooldown) return;
+
+    // Skip if ALL changed nodes are inside our overlay
+    const hasExternalMutation = mutations.some((m) =>
+      !isInsideOverlay(m.target as Node),
+    );
+    if (!hasExternalMutation) return;
+
+    const inputEl = adapter.getInputEl();
+    if (!inputEl) return;
+    if (attachedInputEls.has(inputEl)) return; // already have listener
+
+    cooldown = true;
+    attachInputListener(inputEl, site, adapter);
+    setTimeout(() => { cooldown = false; }, 1500);
+  });
+
+  mo.observe(document.body, { childList: true, subtree: true });
+}
+
+function isInsideOverlay(node: Node): boolean {
+  let current: Node | null = node;
+  while (current) {
+    if (current instanceof Element && current.id === OVERLAY_HOST_ID) return true;
+    current = current.parentNode;
+  }
+  return false;
+}
+
+// ─── DOM Utilities ────────────────────────────────────────────────────────────
+
+function waitForDOM(): Promise<void> {
+  return new Promise((resolve) => {
+    if (document.readyState !== "loading") { resolve(); return; }
+    document.addEventListener("DOMContentLoaded", () => resolve(), { once: true });
+  });
+}
+
+function waitForElement(adapter: SiteAdapter, timeoutMs: number): Promise<HTMLElement | null> {
+  return new Promise((resolve) => {
+    const el = adapter.getInputEl();
+    if (el) { resolve(el); return; }
+
+    const timer = setTimeout(() => { mo.disconnect(); resolve(null); }, timeoutMs);
+
+    const mo = new MutationObserver(() => {
+      if (isInsideOverlay(document.body)) return; // safety guard
+      const found = adapter.getInputEl();
+      if (found) {
+        clearTimeout(timer);
+        mo.disconnect();
+        resolve(found);
+      }
+    });
+
+    mo.observe(document.body, { childList: true, subtree: true });
+  });
+}
+
+// ─── Storage Helpers ──────────────────────────────────────────────────────────
+
 let _cachedSettings: { limits: Record<string, number>; ts: number } | null = null;
-const SETTINGS_CACHE_TTL = 5_000; // 5 seconds
+const SETTINGS_CACHE_TTL = 5_000;
 
 async function getDailyLimit(site: SiteId): Promise<number> {
   try {
@@ -294,31 +330,21 @@ async function getDailyLimit(site: SiteId): Promise<number> {
     if (_cachedSettings && now - _cachedSettings.ts < SETTINGS_CACHE_TTL) {
       return _cachedSettings.limits[site] ?? DEFAULT_LIMITS[site];
     }
-
-    // Try local first (faster), then sync as fallback
     const localData = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
     let settings = localData[STORAGE_KEYS.SETTINGS];
-
     if (!settings) {
       const syncData = await chrome.storage.sync.get(STORAGE_KEYS.SETTINGS);
       settings = syncData[STORAGE_KEYS.SETTINGS];
     }
-
-    if (settings?.limits) {
-      _cachedSettings = { limits: settings.limits, ts: now };
-    }
-
+    if (settings?.limits) _cachedSettings = { limits: settings.limits, ts: now };
     return settings?.limits?.[site] ?? DEFAULT_LIMITS[site];
   } catch {
     return DEFAULT_LIMITS[site];
   }
 }
 
-// Invalidate cache when settings change (popup saves new limits)
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (changes[STORAGE_KEYS.SETTINGS]) {
-    _cachedSettings = null;
-  }
+chrome.storage.onChanged.addListener((changes) => {
+  if (changes[STORAGE_KEYS.SETTINGS]) _cachedSettings = null;
 });
 
 async function getUsedToday(site: SiteId): Promise<number> {
@@ -326,48 +352,8 @@ async function getUsedToday(site: SiteId): Promise<number> {
     const data  = await chrome.storage.local.get(STORAGE_KEYS.USAGE);
     const usage = data[STORAGE_KEYS.USAGE] ?? {};
     const today = new Date().toISOString().slice(0, 10);
-    const key   = `${site}::${today}`;
-    return (usage[key]?.tokens ?? 0) as number;
+    return (usage[`${site}::${today}`]?.tokens ?? 0) as number;
   } catch {
     return 0;
   }
-}
-
-// ─── DOM Text Extraction ──────────────────────────────────────────────────────
-
-/**
- * Extracts the text content from either a <textarea> or a contenteditable node.
- * Normalises whitespace so token estimates are stable.
- */
-function extractText(el: HTMLElement): string {
-  if (el instanceof HTMLTextAreaElement) {
-    return el.value.trim();
-  }
-  // contenteditable – textContent strips HTML tags
-  return (el.textContent ?? "").trim();
-}
-
-// ─── DOM Wait Utility ─────────────────────────────────────────────────────────
-
-function waitForElement(selector: string, timeoutMs: number): Promise<Element | null> {
-  return new Promise((resolve) => {
-    const existing = document.querySelector(selector);
-    if (existing) { resolve(existing); return; }
-
-    const timer = setTimeout(() => {
-      mo.disconnect();
-      resolve(null);
-    }, timeoutMs);
-
-    const mo = new MutationObserver(() => {
-      const el = document.querySelector(selector);
-      if (el) {
-        clearTimeout(timer);
-        mo.disconnect();
-        resolve(el);
-      }
-    });
-
-    mo.observe(document.body, { childList: true, subtree: true });
-  });
 }
