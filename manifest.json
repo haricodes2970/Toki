@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Toki – AI Usage Monitor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Real-time token usage tracker and smart prompt optimizer for ChatGPT, Gemini, Claude, and Grok.",
   "author": "Hari",
 

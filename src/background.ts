@@ -15,7 +15,7 @@
 //   alarm exists (service workers can be killed at any time in MV3).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { TokiMessage, TokiSettings, UsageRecord, SiteId, DailyLimits } from "@/shared/types";
+import type { TokiMessage, TokiSettings, UsageRecord, SiteId, DailyLimits, SiteState } from "@/shared/types";
 import { DAILY_RESET_ALARM, STORAGE_KEYS, DEFAULT_LIMITS } from "@/shared/constants";
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -102,6 +102,12 @@ async function handleMessage(message: TokiMessage): Promise<unknown> {
     case "RESET_USAGE":
       return resetDailyUsage();
 
+    case "GET_SITE_STATE":
+      return getSiteState(message.payload.hostname);
+
+    case "SET_SITE_STATE":
+      return setSiteState(message.payload.hostname, message.payload.state);
+
     default:
       console.warn("[Toki] Unknown message type:", (message as { type: string }).type);
       return { ok: false, error: "unknown_message_type" };
@@ -125,9 +131,10 @@ async function initStorage(): Promise<void> {
   }
 
   await chrome.storage.local.set({
-    [STORAGE_KEYS.SETTINGS]: syncData[STORAGE_KEYS.SETTINGS] ?? defaultSettings,
-    [STORAGE_KEYS.USAGE]:    {},
-    [STORAGE_KEYS.HISTORY]:  [],
+    [STORAGE_KEYS.SETTINGS]:   syncData[STORAGE_KEYS.SETTINGS] ?? defaultSettings,
+    [STORAGE_KEYS.USAGE]:      {},
+    [STORAGE_KEYS.HISTORY]:    [],
+    [STORAGE_KEYS.SITE_STATE]: {},
   });
 }
 
@@ -263,6 +270,39 @@ async function checkDateRollover(): Promise<void> {
     console.log("[Toki] Stale usage detected (browser was closed overnight) – resetting.");
     await resetDailyUsage();
   }
+}
+
+// ─── Site State ───────────────────────────────────────────────────────────────
+// Per-hostname object: plan, offsetTokens, consent flag, rolling timestamps.
+// Stored in chrome.storage.local (device-specific, messageTimestamps are high-write).
+
+const SITE_STATE_DEFAULTS: SiteState = {
+  plan:              "free",
+  offsetTokens:      0,
+  consented:         null,
+  lastReset:         0,
+  messageTimestamps: [],
+};
+
+async function getSiteState(hostname: string): Promise<SiteState> {
+  const data  = await chrome.storage.local.get(STORAGE_KEYS.SITE_STATE);
+  const store = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+  return store[hostname] ?? { ...SITE_STATE_DEFAULTS, lastReset: Date.now() };
+}
+
+async function setSiteState(
+  hostname: string,
+  partial:  Partial<SiteState>,
+): Promise<{ ok: boolean }> {
+  const data    = await chrome.storage.local.get(STORAGE_KEYS.SITE_STATE);
+  const store   = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+  const current = store[hostname] ?? { ...SITE_STATE_DEFAULTS, lastReset: Date.now() };
+
+  // Merge: for messageTimestamps always replace (caller manages the array)
+  store[hostname] = { ...current, ...partial };
+
+  await chrome.storage.local.set({ [STORAGE_KEYS.SITE_STATE]: store });
+  return { ok: true };
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────

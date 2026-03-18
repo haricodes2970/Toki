@@ -3,6 +3,9 @@
 
 // ─── Site ─────────────────────────────────────────────────────────────────────
 
+export type ResetType = "daily" | "rolling";
+export type SitePlan  = "free" | "plus" | "pro" | "advanced" | "xpremium" | "custom";
+
 export type SiteId = "chatgpt" | "gemini" | "claude" | "grok";
 
 export interface SiteConfig {
@@ -61,6 +64,23 @@ export type OverlayPosition =
   | "top-right"
   | "top-left";
 
+// ─── Per-site consent & plan state ───────────────────────────────────────────
+// Stored under STORAGE_KEYS.SITE_STATE as { [hostname]: SiteState }.
+// Lives in chrome.storage.local (device-specific; messageTimestamps are high-write).
+
+export interface SiteState {
+  /** Which plan the user selected – determines which PLAN_PRESET budget applies */
+  plan:              SitePlan;
+  /** Tokens manually entered by user ("Already used ___ tokens today") */
+  offsetTokens:      number;
+  /** null = not yet prompted; true = user allowed; false = user denied */
+  consented:         boolean | null;
+  /** Unix ms of last manual or automatic reset */
+  lastReset:         number;
+  /** Unix ms timestamp of each recorded send – used for rolling-window math */
+  messageTimestamps: number[];
+}
+
 // ─── Messages (background ↔ content ↔ popup) ─────────────────────────────────
 
 export type TokiMessage =
@@ -68,8 +88,10 @@ export type TokiMessage =
   | { type: "GET_USAGE";     payload: { siteId?: SiteId } }
   | { type: "GET_SETTINGS";  payload?: never }
   | { type: "SET_SETTINGS";  payload: Partial<TokiSettings> }
-  | { type: "RESET_USAGE";   payload?: never }
-  | { type: "USAGE_UPDATED"; payload: UsageRecord };
+  | { type: "RESET_USAGE";    payload?: never }
+  | { type: "USAGE_UPDATED";  payload: UsageRecord }
+  | { type: "GET_SITE_STATE"; payload: { hostname: string } }
+  | { type: "SET_SITE_STATE"; payload: { hostname: string; state: Partial<SiteState> } };
 
 // ─── API Responses ────────────────────────────────────────────────────────────
 

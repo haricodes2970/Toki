@@ -17,8 +17,10 @@ import type {
   TokiSettings,
   DailyLimits,
   UsageRecord,
+  SiteState,
+  SitePlan,
 } from "@/shared/types";
-import { DEFAULT_LIMITS, SITE_CONFIGS, STORAGE_KEYS } from "@/shared/constants";
+import { DEFAULT_LIMITS, SITE_CONFIGS, STORAGE_KEYS, PLAN_PRESETS } from "@/shared/constants";
 
 // ─── All 4 sites in display order ────────────────────────────────────────────
 
@@ -44,6 +46,18 @@ function Popup() {
   const [prompts, setPrompts] = useState<Record<SiteId, number>>({
     chatgpt: 0, gemini: 0, claude: 0, grok: 0,
   });
+  // Selected plan per site (drives limit preset auto-fill in Settings tab)
+  const [plans, setPlans] = useState<Record<SiteId, SitePlan>>({
+    chatgpt: "free", gemini: "free", claude: "free", grok: "free",
+  });
+  // Offset = tokens manually declared by user ("already used X today")
+  const [offsets, setOffsets] = useState<Record<SiteId, number>>({
+    chatgpt: 0, gemini: 0, claude: 0, grok: 0,
+  });
+  // Controlled string for each offset input (so user can clear/type freely)
+  const [offsetDraft, setOffsetDraft] = useState<Record<SiteId, string>>({
+    chatgpt: "", gemini: "", claude: "", grok: "",
+  });
   const [resetTime, setResetTime] = useState("--:--:--");
   const [saved, setSaved]         = useState(false);
   const [tab, setTab]             = useState<"usage" | "settings">("usage");
@@ -58,6 +72,29 @@ function Popup() {
         setWarningPct(Math.round((s.warningThreshold ?? 0.8) * 100));
         setOverlay(s.overlayEnabled ?? true);
       }
+    });
+
+    // Per-site plans and offsets from SITE_STATE
+    chrome.storage.local.get(STORAGE_KEYS.SITE_STATE, (data) => {
+      const store = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+      const hmMap: Record<SiteId, string> = {
+        chatgpt: "chatgpt.com",
+        gemini:  "gemini.google.com",
+        claude:  "claude.ai",
+        grok:    "grok.x.ai",
+      };
+      const o: Record<SiteId, number>   = { chatgpt: 0,      gemini: 0,     claude: 0,     grok: 0 };
+      const p: Record<SiteId, SitePlan> = { chatgpt: "free", gemini: "free", claude: "free", grok: "free" };
+      for (const site of SITES) {
+        const ss = store[hmMap[site]];
+        if (ss) {
+          o[site] = ss.offsetTokens ?? 0;
+          p[site] = ss.plan ?? "free";
+        }
+      }
+      setOffsets(o);
+      setPlans(p);
+      setOffsetDraft({ chatgpt: "", gemini: "", claude: "", grok: "" });
     });
 
     // Usage from local storage (device-local, high-write)
@@ -138,6 +175,49 @@ function Popup() {
     }
   };
 
+  // Hostname lookup (stable, defined once at component scope)
+  const HOSTNAME_MAP: Record<SiteId, string> = {
+    chatgpt: "chatgpt.com",
+    gemini:  "gemini.google.com",
+    claude:  "claude.ai",
+    grok:    "grok.x.ai",
+  };
+
+  // ── Plan change handler ─────────────────────────────────────────────────
+  // Selecting a preset auto-fills the token limit; "custom" leaves it untouched.
+  const onPlanChange = useCallback((site: SiteId, plan: SitePlan) => {
+    setPlans((prev) => ({ ...prev, [site]: plan }));
+    const preset = PLAN_PRESETS[site][plan];
+    if (plan !== "custom" && preset !== undefined) {
+      setLimits((prev) => ({ ...prev, [site]: preset }));
+    }
+    // Persist plan choice to SITE_STATE
+    const hostname = HOSTNAME_MAP[site];
+    chrome.storage.local.get(STORAGE_KEYS.SITE_STATE, (data) => {
+      const store   = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+      const current = store[hostname] ?? { plan: "free", offsetTokens: 0, consented: null, lastReset: Date.now(), messageTimestamps: [] };
+      store[hostname] = { ...current, plan };
+      chrome.storage.local.set({ [STORAGE_KEYS.SITE_STATE]: store });
+    });
+  }, []);
+
+  // ── Offset save handler ─────────────────────────────────────────────────
+  const saveOffset = useCallback((site: SiteId) => {
+    const raw = offsetDraft[site];
+    const n   = parseInt(raw, 10);
+    if (Number.isNaN(n) || n < 0) return;
+    const hostname = HOSTNAME_MAP[site];
+    // Read current state, patch offsetTokens, write back
+    chrome.storage.local.get(STORAGE_KEYS.SITE_STATE, (data) => {
+      const store   = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+      const current = store[hostname] ?? { plan: "free", offsetTokens: 0, consented: null, lastReset: Date.now(), messageTimestamps: [] };
+      store[hostname] = { ...current, offsetTokens: n };
+      chrome.storage.local.set({ [STORAGE_KEYS.SITE_STATE]: store });
+      setOffsets((prev) => ({ ...prev, [site]: n }));
+      setOffsetDraft((prev) => ({ ...prev, [site]: "" }));
+    });
+  }, [offsetDraft]);
+
   // ── Render ─────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col min-h-[480px]">
@@ -158,11 +238,13 @@ function Popup() {
       {tab === "usage" && (
         <div className="flex-1 px-4 pb-4 space-y-2.5">
           {SITES.map((site) => {
-            const pct = limits[site] > 0
-              ? Math.min((usage[site] / limits[site]) * 100, 100)
+            // Effective usage = tracked tokens + manual offset
+            const effective  = usage[site] + offsets[site];
+            const pct        = limits[site] > 0
+              ? Math.min((effective / limits[site]) * 100, 100)
               : 0;
-            const left = Math.max(limits[site] - usage[site], 0);
-            const avgPer = prompts[site] > 0 ? Math.round(usage[site] / prompts[site]) : 1000;
+            const left       = Math.max(limits[site] - effective, 0);
+            const avgPer     = prompts[site] > 0 ? Math.round(usage[site] / prompts[site]) : 1_000;
             const promptsLeft = left > 0 ? Math.floor(left / avgPer) : 0;
 
             return (
@@ -176,7 +258,7 @@ function Popup() {
                     <span className="text-xs font-semibold">{SITE_CONFIGS[site].label}</span>
                   </div>
                   <span className="text-[10px] text-zinc-500 tabular-nums">
-                    {fmt(usage[site])} / {fmt(limits[site])}
+                    {fmt(effective)} / {fmt(limits[site])}
                   </span>
                 </div>
 
@@ -191,9 +273,37 @@ function Popup() {
                   />
                 </div>
 
-                <div className="flex justify-between text-[10px] text-zinc-500">
+                <div className="flex justify-between text-[10px] text-zinc-500 mb-2">
                   <span>{Math.round(pct)}% used</span>
                   <span>~{promptsLeft} prompts left</span>
+                </div>
+
+                {/* ── Manual offset input ────────────────────────────────── */}
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={0}
+                    step={100}
+                    placeholder={offsets[site] > 0 ? String(offsets[site]) : "Already used…"}
+                    value={offsetDraft[site]}
+                    onChange={(e) =>
+                      setOffsetDraft((prev) => ({ ...prev, [site]: e.target.value }))
+                    }
+                    onKeyDown={(e) => { if (e.key === "Enter") saveOffset(site); }}
+                    className="flex-1 h-7 rounded-md bg-zinc-800 border border-zinc-700 px-2 text-[11px] text-white placeholder-zinc-600 outline-none focus:border-toki-500 focus:ring-1 focus:ring-toki-500/30 tabular-nums"
+                  />
+                  <button
+                    onClick={() => saveOffset(site)}
+                    disabled={!offsetDraft[site]}
+                    className="h-7 px-2 rounded-md text-[11px] font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    Set
+                  </button>
+                  {offsets[site] > 0 && (
+                    <span className="text-[10px] text-zinc-600 tabular-nums">
+                      +{fmt(offsets[site])} offset
+                    </span>
+                  )}
                 </div>
               </div>
             );
@@ -220,6 +330,36 @@ function Popup() {
       {/* ── Settings tab ─────────────────────────────────────────────── */}
       {tab === "settings" && (
         <div className="flex-1 px-4 pb-4 space-y-4">
+          {/* Plan presets */}
+          <Section title="Your Plan">
+            <div className="space-y-2">
+              {SITES.map((site) => {
+                const presets = Object.keys(PLAN_PRESETS[site]) as SitePlan[];
+                return (
+                  <div key={site} className="flex items-center gap-3">
+                    <div
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ background: SITE_COLOURS[site] }}
+                    />
+                    <label className="text-xs text-zinc-400 w-16">{SITE_CONFIGS[site].label}</label>
+                    <select
+                      value={plans[site]}
+                      onChange={(e) => onPlanChange(site, e.target.value as SitePlan)}
+                      className="flex-1 h-8 rounded-lg bg-zinc-800 border border-zinc-700 px-2 text-xs text-white outline-none focus:border-toki-500 capitalize"
+                    >
+                      {presets.map((p) => (
+                        <option key={p} value={p}>{p}</option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-[10px] text-zinc-600 mt-1.5">
+              Selecting a plan auto-fills the daily token limit below.
+            </p>
+          </Section>
+
           {/* Per-site limits */}
           <Section title="Daily Token Limits">
             <div className="space-y-2">

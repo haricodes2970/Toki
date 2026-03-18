@@ -10,9 +10,10 @@
 //  • extractText delegates to adapter (innerText vs .value)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { SiteId, TokiMessage, UsageRecord } from "@/shared/types";
-import { DEFAULT_LIMITS, OVERLAY_HOST_ID, STORAGE_KEYS } from "@/shared/constants";
+import type { SiteId, TokiMessage, UsageRecord, SiteState } from "@/shared/types";
+import { DEFAULT_LIMITS, OVERLAY_HOST_ID, STORAGE_KEYS, SITE_CONFIGS } from "@/shared/constants";
 import { mountOverlay } from "@/overlay/mountOverlay";
+import { mountConsentCard, unmountConsentCard } from "@/overlay/mountConsentCard";
 import { estimateTokens, ensureTokenizerReady } from "@/overlay/tokenizer";
 import { getAdapter } from "@/adapters/index";
 import type { SiteAdapter } from "@/adapters/types";
@@ -74,10 +75,50 @@ if (!siteId) {
   boot(siteId);
 }
 
+// ─── Hostname map ────────────────────────────────────────────────────────────
+// Maps SiteId → canonical storage hostname key used in SITE_STATE.
+
+const SITE_HOSTNAME: Record<SiteId, string> = {
+  chatgpt: "chatgpt.com",
+  gemini:  "gemini.google.com",
+  claude:  "claude.ai",
+  grok:    "grok.x.ai",
+};
+
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
 async function boot(site: SiteId): Promise<void> {
   await Promise.all([waitForDOM(), ensureTokenizerReady()]);
+
+  // ── Consent gate ──────────────────────────────────────────────────────────
+  const hostname  = SITE_HOSTNAME[site];
+  const consented = await getConsent(hostname);
+
+  if (consented === false) {
+    // User previously denied – never show anything on this site
+    console.log(`[Toki] Consent denied for "${hostname}" – aborting.`);
+    return;
+  }
+
+  if (consented === null) {
+    // First visit – show consent card and wait for user's decision
+    console.log(`[Toki] No consent recorded for "${hostname}" – showing consent card.`);
+    const siteName = SITE_CONFIGS[site].label;
+    mountConsentCard(siteName);
+
+    const granted = await waitForConsentDecision();
+    unmountConsentCard();
+
+    // Persist decision
+    await persistConsent(hostname, granted);
+    if (!granted) {
+      console.log(`[Toki] User denied consent for "${hostname}".`);
+      return;
+    }
+    console.log(`[Toki] User granted consent for "${hostname}".`);
+  }
+
+  // ── Full boot ─────────────────────────────────────────────────────────────
   mountOverlay(site);
 
   const adapter = getAdapter(site);
@@ -85,6 +126,46 @@ async function boot(site: SiteId): Promise<void> {
 
   // SPA navigation: re-run attachment on every route change
   listenForNavigation(site, adapter);
+}
+
+// ─── Consent helpers ──────────────────────────────────────────────────────────
+
+async function getConsent(hostname: string): Promise<boolean | null> {
+  try {
+    const data  = await chrome.storage.local.get(STORAGE_KEYS.SITE_STATE);
+    const store = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+    return store[hostname]?.consented ?? null;
+  } catch {
+    return null; // default to asking
+  }
+}
+
+async function persistConsent(hostname: string, granted: boolean): Promise<void> {
+  try {
+    const data    = await chrome.storage.local.get(STORAGE_KEYS.SITE_STATE);
+    const store   = (data[STORAGE_KEYS.SITE_STATE] ?? {}) as Record<string, SiteState>;
+    const current = store[hostname] ?? {
+      plan: "free", offsetTokens: 0, consented: null,
+      lastReset: Date.now(), messageTimestamps: [],
+    };
+    store[hostname] = { ...current, consented: granted };
+    await chrome.storage.local.set({ [STORAGE_KEYS.SITE_STATE]: store });
+  } catch (err) {
+    console.error("[Toki] Failed to persist consent:", err);
+  }
+}
+
+function waitForConsentDecision(): Promise<boolean> {
+  return new Promise((resolve) => {
+    function onGrant()  { cleanup(); resolve(true);  }
+    function onDeny()   { cleanup(); resolve(false); }
+    function cleanup() {
+      document.removeEventListener("toki:consent-granted", onGrant);
+      document.removeEventListener("toki:consent-denied",  onDeny);
+    }
+    document.addEventListener("toki:consent-granted", onGrant, { once: true });
+    document.addEventListener("toki:consent-denied",  onDeny,  { once: true });
+  });
 }
 
 // ─── Attach all listeners ─────────────────────────────────────────────────────
