@@ -1,10 +1,11 @@
 // EXTENSION FILE: src/overlay/Overlay.tsx
 // ─────────────────────────────────────────────────────────────────────────────
 // Floating, draggable, minimizable overlay panel living inside a Shadow DOM.
-// Listens to two CustomEvents dispatched by content.ts:
+// Listens to CustomEvents dispatched by content.ts:
 //
 //   toki:prompt-update   – fired on every keystroke with live token estimate
 //   toki:usage-recorded  – fired after a prompt is committed to storage
+//   toki:pre-send        – fired before submit, triggers PreSendWarning modal
 //
 // All styles are inline CSS-in-JS (no Tailwind class names reach the shadow).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19,7 +20,9 @@ import React, {
 import type { SiteId, UsageRecord, TokiSettings } from "@/shared/types";
 import { DEFAULT_LIMITS, SITE_CONFIGS } from "@/shared/constants";
 import WarningToast, { type ToastPayload } from "./WarningToast";
-import type { PromptUpdateDetail, UsageRecordedDetail } from "@/content";
+import PreSendWarning from "./PreSendWarning";
+import { analyzePrompt } from "./optimizer";
+import type { PromptUpdateDetail, UsageRecordedDetail, PreSendDetail } from "@/content";
 import { tokenLabel } from "./tokenizer";
 
 // ─── Props ────────────────────────────────────────────────────────────────────
@@ -62,6 +65,7 @@ export default function Overlay({ siteId }: OverlayProps) {
   const [limitDraft, setLimitDraft]     = useState(String(dailyLimit));
   const [resetTime, setResetTime]       = useState("--:--:--");
   const [toast, setToast]               = useState<ToastPayload | null>(null);
+  const [preSend, setPreSend]           = useState<PreSendDetail | null>(null);
 
   // ── Drag state ────────────────────────────────────────────────────────────
   const [dragging, setDragging]   = useState(false);
@@ -153,9 +157,27 @@ export default function Overlay({ siteId }: OverlayProps) {
       setPrompts((prev) => prev + p);
       setDraftTokens(0);
       setDraftPct(0);
+      setPreSend(null);
     }
     document.addEventListener("toki:usage-recorded", handler);
     return () => document.removeEventListener("toki:usage-recorded", handler);
+  }, []);
+
+  // ── toki:pre-send (intercepted submit – show modal) ───────────────────────
+  useEffect(() => {
+    function handler(e: Event) {
+      const detail = (e as CustomEvent<PreSendDetail>).detail;
+      // Only intercept if over warning threshold or has optimizer suggestions
+      const optimizer = analyzePrompt(detail.promptText);
+      if (detail.isOverWarning || optimizer.suggestions.length > 0) {
+        setPreSend(detail);
+      } else {
+        // Safe to send – dispatch confirmation immediately
+        document.dispatchEvent(new CustomEvent("toki:pre-send-confirmed"));
+      }
+    }
+    document.addEventListener("toki:pre-send", handler);
+    return () => document.removeEventListener("toki:pre-send", handler);
   }, []);
 
   // ── Reset countdown ───────────────────────────────────────────────────────
@@ -238,6 +260,25 @@ export default function Overlay({ siteId }: OverlayProps) {
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
     >
+      {/* Pre-send warning modal */}
+      {preSend && (
+        <PreSendWarning
+          draftTokens={preSend.draftTokens}
+          totalIfSent={preSend.totalIfSent}
+          limitTokens={preSend.limitTokens}
+          pct={preSend.pct}
+          optimizer={analyzePrompt(preSend.promptText)}
+          onSend={() => {
+            setPreSend(null);
+            document.dispatchEvent(new CustomEvent("toki:pre-send-confirmed"));
+          }}
+          onCancel={() => {
+            setPreSend(null);
+            document.dispatchEvent(new CustomEvent("toki:pre-send-cancelled"));
+          }}
+        />
+      )}
+
       {/* Toast stacks above the panel */}
       <WarningToast payload={toast} onDismiss={() => setToast(null)} />
 

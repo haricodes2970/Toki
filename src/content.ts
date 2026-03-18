@@ -34,6 +34,16 @@ export interface UsageRecordedDetail {
   siteId:  SiteId;
 }
 
+/** Fired just before a prompt is submitted – Overlay decides whether to block */
+export interface PreSendDetail {
+  promptText:    string;
+  draftTokens:   number;
+  totalIfSent:   number;
+  limitTokens:   number;
+  pct:           number;
+  isOverWarning: boolean;
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const WARNING_THRESHOLD  = 80;
@@ -196,9 +206,68 @@ function attachSubmitListeners(site: SiteId, adapter: SiteAdapter): void {
 function scheduleCapture(site: SiteId, adapter: SiteAdapter): void {
   if (submitDebounceTimer) clearTimeout(submitDebounceTimer);
   submitDebounceTimer = setTimeout(() => {
-    void captureAndRecord(site, adapter);
+    void interceptAndCapture(site, adapter);
     submitDebounceTimer = null;
   }, SUBMIT_DEBOUNCE_MS);
+}
+
+// ─── Pre-send Intercept ───────────────────────────────────────────────────────
+// Fires toki:pre-send → waits for Overlay's decision → then records or aborts.
+
+async function interceptAndCapture(site: SiteId, adapter: SiteAdapter): Promise<void> {
+  const inputEl = adapter.getInputEl();
+  const text    = liveText || (inputEl ? adapter.extractText(inputEl) : "");
+  if (!text || text === lastRecordedText) return;
+
+  const limit = await getDailyLimit(site);
+  const used  = await getUsedToday(site);
+  const draft = estimateTokens(text);
+  const total = used + draft;
+  const pct   = limit > 0 ? Math.min((total / limit) * 100, 100) : 0;
+
+  const detail: PreSendDetail = {
+    promptText:    text,
+    draftTokens:   draft,
+    totalIfSent:   total,
+    limitTokens:   limit,
+    pct,
+    isOverWarning: pct >= WARNING_THRESHOLD,
+  };
+
+  // Dispatch pre-send event – Overlay will either confirm or cancel
+  document.dispatchEvent(
+    new CustomEvent<PreSendDetail>("toki:pre-send", { detail }),
+  );
+
+  // Wait for Overlay's decision (max 30 seconds in case user is reading tips)
+  const confirmed = await waitForPreSendDecision(30_000);
+  if (!confirmed) {
+    console.log("[Toki] Pre-send cancelled by user.");
+    return;
+  }
+
+  await captureAndRecord(site, adapter);
+}
+
+function waitForPreSendDecision(timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(true); // timeout = let it through
+    }, timeoutMs);
+
+    function onConfirm()  { cleanup(); resolve(true);  }
+    function onCancel()   { cleanup(); resolve(false); }
+
+    function cleanup() {
+      clearTimeout(timer);
+      document.removeEventListener("toki:pre-send-confirmed", onConfirm);
+      document.removeEventListener("toki:pre-send-cancelled", onCancel);
+    }
+
+    document.addEventListener("toki:pre-send-confirmed", onConfirm, { once: true });
+    document.addEventListener("toki:pre-send-cancelled", onCancel,  { once: true });
+  });
 }
 
 // ─── Capture & Record ─────────────────────────────────────────────────────────
