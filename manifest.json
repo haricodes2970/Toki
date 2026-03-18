@@ -6,25 +6,25 @@
   "author": "Hari",
 
   "icons": {
-    "16":  "public/icons/icon16.png",
-    "32":  "public/icons/icon32.png",
-    "48":  "public/icons/icon48.png",
-    "128": "public/icons/icon128.png"
+    "16":  "icons/icon16.png",
+    "32":  "icons/icon32.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
   },
 
   "action": {
     "default_popup": "src/popup/popup.html",
     "default_title": "Toki – AI Usage Monitor",
     "default_icon": {
-      "16":  "public/icons/icon16.png",
-      "32":  "public/icons/icon32.png",
-      "48":  "public/icons/icon48.png",
-      "128": "public/icons/icon128.png"
+      "16":  "icons/icon16.png",
+      "32":  "icons/icon32.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
     }
   },
 
   "background": {
-    "service_worker": "dist/background.js",
+    "service_worker": "src/background.ts",
     "type": "module"
   },
 
@@ -37,8 +37,7 @@
         "https://grok.x.ai/*",
         "https://x.com/i/grok*"
       ],
-      "js": ["dist/content.js"],
-      "css": ["dist/content.css"],
+      "js": ["src/content.ts"],
       "run_at": "document_idle"
     }
   ],
@@ -63,13 +62,13 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["dist/content.css", "public/icons/*"],
+      "resources": ["icons/*"],
       "matches": [
         "https://chatgpt.com/*",
         "https://gemini.google.com/*",
         "https://claude.ai/*",
         "https://grok.x.ai/*",
-        "https://x.com/i/grok*"
+        "https://x.com/*"
       ]
     }
   ]
