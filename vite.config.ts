@@ -3,44 +3,56 @@ import react from "@vitejs/plugin-react";
 import webExtension from "vite-plugin-web-extension";
 import path from "path";
 
-export default defineConfig(({ mode }) => ({
-  plugins: [
-    react(),
-    webExtension({
-      manifest: "./manifest.json",
-      // vite-plugin-web-extension handles multi-entry bundling:
-      // background, content scripts, popup, dashboard – all in one pass.
-      // popup.html is already declared in manifest action.default_popup – don't list it here.
-      // Only list entries NOT referenced anywhere in manifest.json.
-      additionalInputs: [
-        "src/dashboard/dashboard.html",
-      ],
-    }),
-  ],
+export default defineConfig(({ mode }) => {
+  const isDev = mode === "development";
 
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "src"),
+  return {
+    plugins: [
+      react(),
+      webExtension({
+        manifest: "./manifest.json",
+        // popup.html is already in manifest action.default_popup – don't list here.
+        // Only list entries NOT referenced anywhere in manifest.json.
+        additionalInputs: [
+          "src/dashboard/dashboard.html",
+        ],
+      }),
+    ],
+
+    resolve: {
+      alias: {
+        "@": path.resolve(__dirname, "src"),
+      },
     },
-  },
 
-  build: {
-    outDir: "dist",
-    emptyOutDir: true,
-    sourcemap: mode === "development" ? "inline" : false,
-    minify: mode === "production",
-
-    rollupOptions: {
-      // Prevent tiktoken WASM from being tree-shaken
-      external: [],
+    define: {
+      // Ensures production logger strips console.log at build time
+      // (import.meta.env.MODE is replaced with the string literal "production")
+      __DEV__: isDev,
     },
-  },
 
-  // Required for WASM (js-tiktoken ships a .wasm file)
-  optimizeDeps: {
-    exclude: ["js-tiktoken"],
-  },
+    build: {
+      outDir: "dist",
+      emptyOutDir: true,
+      sourcemap: isDev ? "inline" : false,
+      minify: isDev ? false : "esbuild",
 
-  // Inline WASM in the bundle so MV3 CSP is satisfied
-  assetsInlineLimit: 0,
-}));
+      rollupOptions: {
+        output: {
+          // Deterministic chunk names (easier to audit CSP allowlists)
+          chunkFileNames: "chunks/[name]-[hash].js",
+          assetFileNames: "assets/[name]-[hash][extname]",
+        },
+      },
+    },
+
+    // WASM: js-tiktoken ships a .wasm binary that must not be processed by Vite
+    optimizeDeps: {
+      exclude: ["js-tiktoken"],
+    },
+
+    // Don't inline WASM as base64 – load it as a separate asset instead.
+    // The extension CSP allows 'wasm-unsafe-eval' for the .wasm binary fetch.
+    assetsInlineLimit: 0,
+  };
+});
